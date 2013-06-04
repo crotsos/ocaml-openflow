@@ -148,7 +148,7 @@ module Table = struct
              cache_entries=[];}) in  
 
     (* log data to the visualisation server *)
-    let _ = 
+(*    let _ = 
       match (Lwt.get OS.Topology.node_name) with
       | None -> ()
       | Some(node_name) ->  
@@ -161,7 +161,7 @@ module Table = struct
             ("action", (Rpc.String action_str));
           ] in
           OS.Console.broadcast "flow" (Jsonrpc.to_string msg)
-    in
+    in*)
 
     let _ = Hashtbl.replace table.entries t.OP.Flow_mod.of_match entry in
     (* In the fast path table, I need to delete any conflicting entries *)
@@ -199,7 +199,7 @@ module Table = struct
             let _ = Hashtbl.remove table.entries of_match in 
             
             (* log removal of flow *)
-            let _ = 
+(*            let _ = 
               match Lwt.get OS.Topology.node_name with
               | None -> ()
               | Some(node_name) -> 
@@ -211,7 +211,7 @@ module Table = struct
                     ("flow", (Rpc.String flow_str)); 
                     ("action", (Rpc.String action_str));] in
                     OS.Console.broadcast "flow" (Jsonrpc.to_string msg)
-            in
+            in *)
                (of_match, flow)::ret
           ) else ret
           ) table.entries [] in
