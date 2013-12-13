@@ -348,6 +348,7 @@ module Switch = struct
     mutable echo_resp_received : bool;
     table: Table.t;
     stats: stats;
+    mutable pkt_in_len : int; 
     mutable errornum : uint32; 
     mutable portnum : int;
     features : OP.Switch.features;
@@ -507,7 +508,7 @@ module Switch = struct
         return (cp (sp "[switch] forward_frame: Port %d unregistered \n%!" local))
     | OP.Port.Controller -> begin 
       let size = 
-         if (Cstruct.len bits > pkt_size) then
+         if ((pkt_size > 0) && (Cstruct.len bits > pkt_size)) then
            pkt_size
          else 
            Cstruct.len bits
@@ -651,7 +652,7 @@ let process_frame_inner st p frame =
 
        (* Disable for now packet trimming for buffered packets *)
        let size =  
-         if (Cstruct.len frame > 92) then 92
+         if (Cstruct.len frame > st.Switch.pkt_in_len) then st.Switch.pkt_in_len
          else Cstruct.len frame in
        let (h, pkt_in) = create_pkt_in ~buffer_id ~in_port ~reason:NO_MATCH 
            ~data:(Cstruct.sub frame 0 size) in
@@ -871,7 +872,7 @@ let process_openflow st t msg =
         end
     end
   | OP.Get_config_req(h) ->
-    let resp = OP.Switch.init_switch_config in
+    let resp = OP.Switch.init_switch_config st.Switch.pkt_in_len in
     let h = create ~xid:h.xid GET_CONFIG_RESP OP.Switch.config_get_len in 
     OSK.send_packet t (OP.Get_config_resp(h, resp)) 
  | OP.Barrier_req(h) ->
@@ -900,7 +901,7 @@ let process_openflow st t msg =
       in
       if (fm.buffer_id = -1l) then return () 
       else process_buffer_id st t msg h.xid fm.buffer_id fm.actions
-  | OP.Set_config (h, _) -> return ()
+  | OP.Set_config (h, c) -> st.Switch.pkt_in_len <- c.OP.Switch.miss_send_len; return ()
   | OP.Queue_get_config_resp (h, _, _)
   | OP.Queue_get_config_req (h, _)
   | OP.Barrier_resp h
@@ -1038,7 +1039,7 @@ let del_flow st m =
 let create_switch ?(verbose=false) dpid = 
   Switch.(
     { ports = []; int_to_port = (Hashtbl.create 64); dev_to_port=(Hashtbl.create 64); 
-      controller=None; errornum = 0l; portnum=0; 
+      controller=None; errornum = 0l; portnum=0; pkt_in_len = 92; 
       stats={n_frags=0L; n_hits=0L;n_missed=0L;n_lost=0L;};
       table = (Table.init_table ()); features=(Switch.switch_features dpid); 
       packet_buffer=[]; last_echo_req=0.; echo_resp_received=true;

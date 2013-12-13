@@ -891,7 +891,7 @@ let process_openflow st t msg =
         end
     end
   | OP.Get_config_req(h) ->
-    let resp = OP.Switch.init_switch_config in
+    let resp = (OP.Switch.init_switch_config 3000) in
     let h = create ~xid:h.xid GET_CONFIG_RESP OP.Switch.config_get_len in 
     OSK.send_packet t (OP.Get_config_resp(h, resp)) 
  | OP.Barrier_req(h) ->

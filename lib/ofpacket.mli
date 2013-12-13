@@ -189,7 +189,7 @@ module Switch :
     val marshal_reply_features : int32 -> features -> Cstruct.t -> int
     val get_len : features -> int 
     type config = { drop : bool; reasm : bool; miss_send_len : uint16; }
-    val init_switch_config : config
+    val init_switch_config : int -> config
     val config_get_len : int
     val marshal_switch_config : int32 -> config -> Cstruct.t -> int 
   end

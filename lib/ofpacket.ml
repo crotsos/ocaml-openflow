@@ -673,8 +673,7 @@ module Switch = struct
     miss_send_len: uint16;
   }
 
-  let init_switch_config = {drop=true;
-  reasm=true;miss_send_len=1000;}
+  let init_switch_config miss_send_len = {drop=true;reasm=true;miss_send_len;}
         
   cstruct ofp_switch_config {
     uint16_t flags;           
