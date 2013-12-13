@@ -477,8 +477,9 @@ let process_openflow st dpid t msg =
    end
   | OP.Get_config_req(h) ->
       (* TODO make a custom reply tothe query *) 
-      let h = OP.Header.({h with  ty=FEATURES_RESP}) in
-        send_controller t (OP.Get_config_resp(h, OP.Switch.init_switch_config))
+      let h = OP.Header.({h with  ty=GET_CONFIG_RESP}) in
+        send_controller t (OP.Get_config_resp(h, (OP.Switch.init_switch_config
+        3000) ))
   | OP.Barrier_req(h) ->
       (* TODO just reply for now. need to check this with all switches *)
 (*       let xid = get_new_xid dpid in  *)
@@ -509,12 +510,10 @@ let process_openflow st dpid t msg =
               flow_mod_del_translate st msg xid fm 
   end
   (*Unsupported switch actions *)
+  | OP.Set_config (h, _) -> return () 
   | OP.Port_mod (h, _)
   | OP.Queue_get_config_resp (h, _, _)
   | OP.Queue_get_config_req (h, _)
-  | OP.Set_config (h, _) (* -> 
-      send_controller t 
-        (OP.marshal_error OP.REQUEST_BAD_TYPE bits h.OP.Header.xid) *)
   (* Message that should not be received by a switch *)
   | OP.Port_status (h, _)
   | OP.Flow_removed (h, _)
@@ -613,138 +612,145 @@ let translate_stat flv dpid f =
 
 let process_switch_channel flv st dpid e =
   try_lwt
-  let _ = if (flv.verbose) then cp (sp "[flowvisor-ctrl] %s\n%!" (OE.string_of_event e)) in 
-  match e with 
-  | OE.Datapath_join(dpid, ports) ->
-    let _ = cp (sp "[flowvisor-ctrl]+ switch dpid:%Ld\n%!" dpid) in 
-    let _ = Flowvisor_topology.add_channel flv.flv_topo dpid st in 
-    (* Update local state *)
-    let _ = Hashtbl.replace flv.switches dpid st in
-    Lwt_list.iter_p (add_flowvisor_port flv dpid) ports
-  | OE.Datapath_leave(dpid) ->
-    let _ = (cp(sp "[flowvisor-ctrl]- switch dpid:%Ld\n%!" dpid)) in 
-    let _ = Flowvisor_topology.remove_dpid flv.flv_topo dpid in 
-    (* Need to remove ports and port mapping and disard any state 
+    let _ = if (flv.verbose) then cp (sp "[flowvisor-ctrl] %s\n%!" (OE.string_of_event e)) in 
+    match e with 
+    | OE.Datapath_join(dpid, ports) ->
+      let _ = cp (sp "[flowvisor-ctrl]+ switch dpid:%Ld\n%!" dpid) in 
+      let _ = Flowvisor_topology.add_channel flv.flv_topo dpid st in 
+      (* Update local state  and send new ports to all connected controllers *)
+      let _ = Hashtbl.replace flv.switches dpid st in 
+      lwt _ = OC.send_data st dpid 
+          OP.(Set_config( (OP.Header.(create SET_CONFIG 0),
+          OP.Switch.(init_switch_config 0x1fff)))) in
+      Lwt_list.iter_p (add_flowvisor_port flv dpid) ports
+    | OE.Datapath_leave(dpid) ->
+      let _ = (cp(sp "[flowvisor-ctrl]- switch dpid:%Ld\n%!" dpid)) in 
+      let _ = Flowvisor_topology.remove_dpid flv.flv_topo dpid in 
+      (* Need to remove ports and port mapping and discard any state 
        * pending for replies. *)
-    Lwt_list.iter_p (del_flowvisor_port flv) 
-      ( Hashtbl.fold (fun vp (dp, _, phy) r -> 
-        if (dp = dpid) then 
-          let _ = Hashtbl.remove flv.port_map vp in
-          phy::r else r) flv.port_map [])
-   | OE.Packet_in(in_port, reason, buffer_id, data, dpid) -> begin
-    let m = OP.Match.raw_packet_to_match in_port data in 
-      match (in_port, m.OP.Match.dl_type) with 
-      | (OP.Port.Port(p), 0x88cc) -> begin
-        match (Flowvisor_topology.process_lldp_packet 
-                  flv.flv_topo dpid p data) with
-        | true -> return ()
-        | false ->
-          let in_port = map_flv_port flv dpid p in
-          let h = OP.Header.(create PACKET_IN 0) in 
-          let pkt = OP.Packet_in.({buffer_id=(-1l);in_port;reason;data;}) in 
-          inform_controllers flv m (OP.Packet_in(h, pkt)) 
-      end
-      | (OP.Port.Port(p), _) when 
-          not (Flowvisor_topology.is_transit_port flv.flv_topo dpid p) -> begin
-        (* translate the buffer id information *)
-          let buffer_id = flv.buffer_id_count in 
-          flv.buffer_id_count <- Int32.succ flv.buffer_id_count;
+      Lwt_list.iter_p (del_flowvisor_port flv) 
+        ( Hashtbl.fold (fun vp (dp, _, phy) r -> 
+             if (dp = dpid) then 
+               let _ = Hashtbl.remove flv.port_map vp in
+               phy::r else r) flv.port_map [])
+    | OE.Packet_in(in_port, reason, buffer_id, data, dpid) -> begin
+        let m = OP.Match.raw_packet_to_match in_port data in
+        let _ = (cp(sp "[flowvisor-ctrl] type:PACKET_IN dpid:%08Ld %s\n%!"
+                      dpid (OP.Match.match_to_string m) )) in
 
-        (* generate packet bits *)
-          let in_port = map_flv_port flv dpid p in
-          let h = OP.Header.(create PACKET_IN 0) in 
-          let pkt = OP.Packet_in.({buffer_id;in_port;reason;data;}) in 
-          let _ = Hashtbl.add flv.buffer_id_map buffer_id (pkt, dpid) in
-          inform_controllers flv m (OP.Packet_in(h, pkt)) 
-        end 
-      | (OP.Port.Port(p), _) -> return ()
-      | _ -> 
-        let _ = cp (sp "[flowvisor-ctrl] Invalid port on Packet_in\n%!") in
-        let h = OP.Header.(create ERROR 0) in 
-        inform_controllers flv m 
-          (OP.Error(h, OP.REQUEST_BAD_STAT, (Cstruct.create 0))) 
-  end
-  | OE.Flow_removed(of_match, r, dur_s, dur_ns, pkts, bytes, dpid)  ->
-      (* translate packet *)
-      let new_in_p = map_flv_port flv dpid (of_port of_match.OP.Match.in_port) in 
-         (* TODO need to pass cookie id, idle, and priority *)
-      let _ = of_match.OP.Match.in_port <- new_in_p in 
+        (* Handle packet appropriately *)
+        match (in_port, m.OP.Match.dl_type) with 
+        | (OP.Port.Port(p), 0x88cc) -> begin
+          (* LLDP is used to infer the topology of the network *)
+            match (Flowvisor_topology.process_lldp_packet 
+                     flv.flv_topo dpid p data) with
+            | true -> return ()
+            | false ->
+              let in_port = map_flv_port flv dpid p in
+              let h = OP.Header.(create PACKET_IN 0) in 
+              let pkt = OP.Packet_in.({buffer_id=(-1l);in_port;reason;data;}) in 
+              inform_controllers flv m (OP.Packet_in(h, pkt)) 
+          end
+        | (OP.Port.Port(p), _) when 
+            not (Flowvisor_topology.is_transit_port flv.flv_topo dpid p) -> begin
+            (* translate the buffer id information *)
+            let buffer_id = flv.buffer_id_count in 
+            flv.buffer_id_count <- Int32.succ flv.buffer_id_count;
+
+            (* generate packet bits *)
+            let in_port = map_flv_port flv dpid p in
+            let h = OP.Header.(create PACKET_IN 0) in 
+            let pkt = OP.Packet_in.({buffer_id;in_port;reason;data;}) in 
+            let _ = Hashtbl.add flv.buffer_id_map buffer_id (pkt, dpid) in
+            inform_controllers flv m (OP.Packet_in(h, pkt)) 
+          end 
+        | (OP.Port.Port(p), _) -> return ()
+        | _ -> 
+          let _ = cp (sp "[flowvisor-ctrl] Invalid Packet_in port\n%!") in
+          let h = OP.Header.(create ERROR 0) in 
+          inform_controllers flv m 
+            (OP.Error(h, OP.REQUEST_BAD_STAT, (Cstruct.create 0))) 
+      end
+    | OE.Flow_removed(of_match, r, dur_s, dur_ns, pkts, bytes, dpid)  ->
+      (* translate packet  TODO need to pass cookie id, idle, and priority *)
+      let _ = of_match.OP.Match.in_port <-
+        map_flv_port flv dpid (of_port of_match.OP.Match.in_port) in 
       let pkt = 
         OP.Flow_removed.(
-           {of_match; cookie=0L;reason=r; priority=0;idle_timeout=0;  
+          {of_match; cookie=0L;reason=r; priority=0;idle_timeout=0;  
            duration_sec=dur_s; duration_nsec=dur_ns; packet_count=pkts;
            byte_count=bytes;}) in
-       let h = OP.Header.(create FLOW_REMOVED 0) in 
-       inform_controllers flv of_match  (OP.Flow_removed(h, pkt))
+      let h = OP.Header.(create FLOW_REMOVED 0) in 
+      inform_controllers flv of_match  (OP.Flow_removed(h, pkt))
     (* TODO: Need to write code to handle stats replies *)
-  | OE.Flow_stats_reply(xid, more, flows, dpid) -> begin
-    if Hashtbl.mem flv.xid_map xid then (
-      let xid_st = Hashtbl.find flv.xid_map xid in
-      match xid_st.cache with
-      | Flows fl -> 
-        (* Group reply separation *)
-        xid_st.cache <- (Flows (fl @ flows));
-        let flows = List.map (translate_stat flv dpid) flows in 
-        let _ = 
-          if not more then 
-            xid_st.dst <- List.filter (fun a -> a <> dpid) xid_st.dst 
-        in
-        if (List.length xid_st.dst = 0 ) then 
-          let _ = Hashtbl.remove flv.xid_map xid in 
-          handle_xid flv st xid_st
-        else
-          return (Hashtbl.replace flv.xid_map xid xid_st)
-      | _ -> return ()
-    ) else  
-      return (cp (sp "[flowvisor-ctrl] Unknown stats reply xid\n%!"))
-  end
-  | OE.Aggr_flow_stats_reply(xid, pkts, bytes, flows, dpid) -> begin
-    if (Hashtbl.mem flv.xid_map xid) then ( 
-      let xid_st = Hashtbl.find flv.xid_map xid in 
-      match xid_st.cache with
-      | Aggr aggr -> 
-        (* Group reply separation *)
-        let aggr = 
-          OP.Stats.({packet_count=(Int64.add pkts aggr.packet_count);
-                     byte_count=(Int64.add bytes aggr.byte_count);
-                     flow_count=(Int32.add flows aggr.flow_count);}) in
-        let _ = xid_st.cache <- (Aggr aggr) in 
-        let _ = 
-          xid_st.dst <- List.filter (fun a -> a <> dpid) xid_st.dst
-        in 
-        if (List.length xid_st.dst = 0 ) then 
-          let _ = Hashtbl.remove flv.xid_map xid in 
-          handle_xid flv st xid_st
-        else 
-          return (Hashtbl.replace flv.xid_map xid xid_st)
-      | _ -> return ()
-    ) else return ()
-    end
+    | OE.Flow_stats_reply(xid, more, flows, dpid) -> begin
+        if Hashtbl.mem flv.xid_map xid then (
+          let xid_st = Hashtbl.find flv.xid_map xid in
+          match xid_st.cache with
+          | Flows fl -> 
+            (* Group reply separation *)
+            xid_st.cache <- (Flows (fl @ flows));
+            let flows = List.map (translate_stat flv dpid) flows in 
+            let _ = 
+              if not more then 
+                xid_st.dst <- List.filter (fun a -> a <> dpid) xid_st.dst 
+            in
+            if (List.length xid_st.dst = 0 ) then 
+              let _ = Hashtbl.remove flv.xid_map xid in 
+              handle_xid flv st xid_st
+            else
+              return (Hashtbl.replace flv.xid_map xid xid_st)
+          | _ -> return ()
+        ) else  
+          return (cp (sp "[flowvisor-ctrl] Unknown stats reply xid\n%!"))
+      end
+    | OE.Aggr_flow_stats_reply(xid, pkts, bytes, flows, dpid) -> begin
+        if (Hashtbl.mem flv.xid_map xid) then ( 
+          let xid_st = Hashtbl.find flv.xid_map xid in 
+          match xid_st.cache with
+          | Aggr aggr -> 
+            (* Group reply separation *)
+            let aggr = 
+              OP.Stats.({packet_count=(Int64.add pkts aggr.packet_count);
+                         byte_count=(Int64.add bytes aggr.byte_count);
+                         flow_count=(Int32.add flows aggr.flow_count);}) in
+            let _ = xid_st.cache <- (Aggr aggr) in 
+            let _ = 
+              xid_st.dst <- List.filter (fun a -> a <> dpid) xid_st.dst
+            in 
+            if (List.length xid_st.dst = 0 ) then 
+              let _ = Hashtbl.remove flv.xid_map xid in 
+              handle_xid flv st xid_st
+            else 
+              return (Hashtbl.replace flv.xid_map xid xid_st)
+          | _ -> return ()
+        ) else return ()
+      end
     | OE.Port_stats_reply(xid, more, ports, dpid) ->  begin
-      if (Hashtbl.mem flv.xid_map xid) then ( 
-        let xid_st = Hashtbl.find flv.xid_map xid in 
-        match xid_st.cache with
-        | Port p -> 
-          (* Group reply separation *)
-          let ports = List.map (fun port -> 
-              let port_id = map_flv_port flv dpid port.OP.Port.port_id in 
-              OP.Port.({port with port_id=(OP.Port.int_of_port port_id);})) ports in 
-          let _ = xid_st.cache <- (Port (p @ ports)) in 
-          let _ = if not more then 
-              xid_st.dst <- List.filter (fun a -> a <> dpid) xid_st.dst in 
+        if (Hashtbl.mem flv.xid_map xid) then ( 
+          let xid_st = Hashtbl.find flv.xid_map xid in 
+          match xid_st.cache with
+          | Port p -> 
+            (* Group reply separation *)
+            let ports = List.map (fun port -> 
+                let port_id = map_flv_port flv dpid port.OP.Port.port_id in 
+                OP.Port.({port with port_id=(OP.Port.int_of_port port_id);})) ports in 
+            let _ = xid_st.cache <- (Port (p @ ports)) in 
+            let _ = if not more then 
+                xid_st.dst <- List.filter (fun a -> a <> dpid) xid_st.dst in 
             if (List.length xid_st.dst = 0 ) then
               let _ = Hashtbl.remove flv.xid_map xid in 
               handle_xid flv st xid_st
             else 
               let _ = Hashtbl.replace flv.xid_map xid xid_st in
-                return ()
-        | _ -> return ()
-      ) else return ()
-    end
+              return ()
+          | _ -> return ()
+        ) else return ()
+      end
     | OE.Table_stats_reply(xid, more, tables, dpid) -> 
-        return ()
+      return ()
     | OE.Port_status(reason, port, dpid) -> 
-    (* TODO: send a port withdrawal to all controllers *)
+      (* TODO: send a port withdrawal to all controllers *)
       add_flowvisor_port flv dpid port
     | _ -> return (cp "[flowvisor-ctrl] Unsupported event\n%!")
   with Not_found -> return (cp(sp "[flowvisor-ctrl] ignore pkt of non existing state\n%!"))
@@ -783,10 +789,8 @@ let add_slice mgr flv of_m dst dpid =
     done)  
 
 let listen st mgr loc = OC.listen mgr loc (init st) 
-let local_listen st conn = 
-  OC.local_connect (OC.init_controller (init st)) conn 
+let local_listen st conn = OC.local_connect (OC.init_controller (init st)) conn 
 
 let remove_slice _ _ = ()
-let add_local_slice flv of_m  conn dpid =
-    ignore_result ( switch_channel flv dpid of_m conn)  
+let add_local_slice flv of_m  conn dpid = ignore_result ( switch_channel flv dpid of_m conn)  
     (* TODO Need to store thread for termination on remove_slice *)
