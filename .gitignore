@@ -6,3 +6,4 @@ setup.bin
 *.docdir
 *.native
 *.byte
+*.xen
